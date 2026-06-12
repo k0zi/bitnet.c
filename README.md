@@ -16,14 +16,12 @@ op emission, KV helpers, logits, and prefill now live in separate modules.
   `Q8_0`, `Q2_K` through `Q8_K`, `IQ2` through `IQ4`, `F16`, `BF16`, and `F32`.
 - CPU backends for scalar, ARM NEON/SDOT, x86 AVX2, x86 AVX512 BW/VNNI,
   and WASM SIMD where kernels exist.
-- Optional native Metal and wgpu-native WebGPU backends.
+- Optional native Metal, wgpu-native WebGPU, CUDA, and ROCm/HIP backends.
 - MoE expert routing with mmap, pread, and expert LRU cache modes.
 - Hybrid SSM/attention execution, including CPU fallback for backend gaps.
 - Per-request `BnSession` state with shared immutable `BnModel`.
 - Prompt cache, stop strings, logprobs, chat formatting, SSE formatting, batch
   prefill, FP16 KV, and TurboQuant KV compression.
-
-CUDA is an architectural target, not an implemented backend yet.
 
 ## Build
 
@@ -42,6 +40,13 @@ make BN_ENABLE_METAL=1 bitnet test_coherence
 # wgpu-native WebGPU
 make fetch-wgpu
 make BN_ENABLE_WEBGPU=1 bitnet test_gpu_wgpu
+
+# CUDA (NVIDIA)
+make BN_ENABLE_CUDA=1 bitnet test_cuda_backend
+
+# ROCm/HIP (AMD) — defaults to gfx1100 (RDNA3); override ROCM_ARCH as needed
+make BN_ENABLE_ROCM=1 bitnet test_rocm_backend
+make BN_ENABLE_ROCM=1 ROCM_ARCH=gfx1030 bitnet   # RX 6000 series (RDNA2)
 ```
 
 `BN_ENABLE_GPU=1` is accepted as a compatibility alias for WebGPU.
@@ -52,6 +57,8 @@ make BN_ENABLE_WEBGPU=1 bitnet test_gpu_wgpu
 ./bitnet models/model.gguf -p "The capital of France is" -n 64 -t 8
 ./bitnet models/model.gguf --metal -p "Hello" -n 64
 ./bitnet models/model.gguf --webgpu --maxseq 4096 -p "Hello" -n 64
+./bitnet models/model.gguf --cuda  --maxseq 4096 -p "Hello" -n 64
+./bitnet models/model.gguf --rocm  --maxseq 4096 -p "Hello" -n 64
 ```
 
 Useful flags:
@@ -67,6 +74,8 @@ Useful flags:
 | `--draft PATH` | Use speculative decoding with a draft model. |
 | `--no-prefill` | Disable batch prefill. |
 | `--maxseq N` | Cap context allocation, especially important on GPU. |
+| `--cuda` | Enable CUDA backend (requires `BN_ENABLE_CUDA=1` build). |
+| `--rocm` | Enable ROCm/HIP backend (requires `BN_ENABLE_ROCM=1` build). |
 
 ## Architecture
 
@@ -80,7 +89,7 @@ quant registry    -> format sizing, kernels, layout capabilities
 backend model     -> uploaded weights and backend-specific packed layouts
 backend session   -> activation/KV buffers and per-request backend state
 transformer plan  -> backend-neutral layer/block decisions
-backend lowerer   -> CPU, Metal, WebGPU, future CUDA execution
+backend lowerer   -> CPU, Metal, WebGPU, CUDA, ROCm execution
 ```
 
 Key modules:
@@ -98,7 +107,7 @@ Key modules:
 | GPU execution and op emission | `src/transformer/gpu.c`, `src/transformer/gpu_emit.c` |
 | KV/logits/prefill helpers | `src/transformer/kv.c`, `src/transformer/logits.c`, `src/transformer/prefill.c` |
 | GPU contract | `include/gpu_backend.h` |
-| Backend-private shader lowering | `src/gpu_shader.h`, `src/gpu_metal.m`, `src/gpu_wgpu.c` |
+| Backend-private shader lowering | `src/gpu_shader.h`, `src/gpu_metal.m`, `src/gpu_wgpu.c`, `src/gpu_cuda.cu`, `src/gpu_rocm.hip` |
 
 `BnModel` is intended to be shared and immutable after load. It does not expose
 GPU handles on weights. Backend handles, stacked buffers, repacked layouts, and
@@ -148,6 +157,8 @@ make avx512-check
 make BN_ENABLE_METAL=1 test_coherence
 ./test_coherence models/qwen2.5-3b-instruct-q4_0.gguf --metal
 make BN_ENABLE_WEBGPU=1 test_gpu_wgpu
+make BN_ENABLE_CUDA=1 test_cuda_backend
+make BN_ENABLE_ROCM=1 test_rocm_backend
 ./test/backend_matrix.sh
 ```
 
@@ -175,7 +186,8 @@ Current strongest areas:
 
 Current weak or unfinished areas:
 
-- CUDA is not implemented.
+- CUDA and ROCm backends are implemented but not yet benchmarked against
+  reference runs; treat them as functional ports pending parity validation.
 - Metal is still behind the CPU paths on some local benchmark cases; treat it as
   functional but not yet the strongest performance backend.
 - WebGPU availability depends on the adapter and wgpu-native platform support.
