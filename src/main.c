@@ -14,7 +14,7 @@
 #ifdef BN_ENABLE_WEBGPU
 #include "gpu_wgpu.h"
 #endif
-#if defined(BN_ENABLE_WEBGPU) || defined(BN_ENABLE_METAL) || defined(BN_ENABLE_CUDA)
+#if defined(BN_ENABLE_WEBGPU) || defined(BN_ENABLE_METAL) || defined(BN_ENABLE_CUDA) || defined(BN_ENABLE_ROCM)
 #include "gpu_moe_cache.h"
 #include "gpu_moe_bridge.h"
 #endif
@@ -23,6 +23,9 @@
 #endif
 #ifdef BN_ENABLE_CUDA
 #include "gpu_cuda.h"
+#endif
+#ifdef BN_ENABLE_ROCM
+#include "gpu_rocm.h"
 #endif
 
 #include <stdio.h>
@@ -69,6 +72,7 @@ typedef struct {
     int webgpu;         // use WebGPU backend for matvec (requires BN_ENABLE_WEBGPU)
     int metal;          // use Metal backend (requires BN_ENABLE_METAL)
     int cuda;           // use CUDA backend (requires BN_ENABLE_CUDA)
+    int rocm;           // use ROCm backend (requires BN_ENABLE_ROCM)
     int gpu_cpu_logits; // hidden diagnostic: run final logits on CPU
     int gpu_compare_logits; // hidden diagnostic: compare GPU logits to CPU
     int gpu_max_storage_binding_mb; // hidden diagnostic: allow large GPU logits
@@ -129,6 +133,7 @@ static void print_usage(const char *prog) {
     fprintf(stderr, "  --webgpu        Enable WebGPU backend (requires BN_ENABLE_WEBGPU=1)\n");
     fprintf(stderr, "  --metal         Enable Metal backend (requires BN_ENABLE_METAL=1)\n");
     fprintf(stderr, "  --cuda          Enable experimental CUDA backend (requires BN_ENABLE_CUDA=1)\n");
+    fprintf(stderr, "  --rocm          Enable experimental ROCm backend (requires BN_ENABLE_ROCM=1)\n");
     fprintf(stderr, "  --gpu-profile <int>  Print GPU timing diagnostics\n");
     fprintf(stderr, "  --metal-disable-barriers  Skip Metal inter-dispatch barriers\n");
     fprintf(stderr, "  --metal-q4-prepared  Use prepared Q4_0 Metal upload layout\n");
@@ -288,6 +293,8 @@ static CLIArgs parse_args(int argc, char **argv) {
             args.metal = 1;
         } else if (strcmp(argv[i], "--cuda") == 0) {
             args.cuda = 1;
+        } else if (strcmp(argv[i], "--rocm") == 0) {
+            args.rocm = 1;
         } else if (strcmp(argv[i], "--gpu-cpu-logits") == 0) {
             args.gpu_cpu_logits = 1;
         } else if (strcmp(argv[i], "--gpu-compare-logits") == 0) {
@@ -361,7 +368,7 @@ static CLIArgs parse_args(int argc, char **argv) {
     return args;
 }
 
-#if defined(BN_ENABLE_WEBGPU) || defined(BN_ENABLE_METAL) || defined(BN_ENABLE_CUDA)
+#if defined(BN_ENABLE_WEBGPU) || defined(BN_ENABLE_METAL) || defined(BN_ENABLE_CUDA) || defined(BN_ENABLE_ROCM)
 static size_t env_mb_or_default(const char *name, int default_mb) {
     const char *s = getenv(name);
     if (!s || !*s)
@@ -665,15 +672,15 @@ int main(int argc, char **argv) {
             fprintf(stderr, "--kv-tq and --kv16 are mutually exclusive\n");
             return 1;
         }
-        if (args.webgpu || args.metal || args.cuda) {
-            fprintf(stderr, "--kv-tq and --webgpu/--metal/--cuda are mutually exclusive (GPU TQ not yet supported)\n");
+        if (args.webgpu || args.metal || args.cuda || args.rocm) {
+            fprintf(stderr, "--kv-tq and --webgpu/--metal/--cuda/--rocm are mutually exclusive (GPU TQ not yet supported)\n");
             return 1;
         }
     }
 
     // Validate GPU backend mutual exclusion
-    if ((args.webgpu ? 1 : 0) + (args.metal ? 1 : 0) + (args.cuda ? 1 : 0) > 1) {
-        fprintf(stderr, "--webgpu, --metal, and --cuda are mutually exclusive\n");
+    if ((args.webgpu ? 1 : 0) + (args.metal ? 1 : 0) + (args.cuda ? 1 : 0) + (args.rocm ? 1 : 0) > 1) {
+        fprintf(stderr, "--webgpu, --metal, --cuda, and --rocm are mutually exclusive\n");
         return 1;
     }
 
@@ -757,15 +764,16 @@ int main(int argc, char **argv) {
         SH_LOG_INFO("GGUF parsed", "version", ver, "tensors", nt, "kv", nkv);
     }
 
-    if ((args.webgpu || args.metal || args.cuda) && !args.max_seq_len_set) {
+    if ((args.webgpu || args.metal || args.cuda || args.rocm) && !args.max_seq_len_set) {
         int model_seq_len = gguf_get_arch_u32(gf, "context_length");
         int n_experts = gguf_get_arch_u32(gf, "expert_count");
-        if ((args.webgpu || args.cuda || (args.metal && n_experts > 0)) &&
+        if ((args.webgpu || args.cuda || args.rocm || (args.metal && n_experts > 0)) &&
             model_seq_len > BN_GPU_DEFAULT_MAXSEQ) {
             args.max_seq_len = BN_GPU_DEFAULT_MAXSEQ;
             SH_LOG_WARN(args.webgpu ? "Auto-capping WebGPU sequence length" :
                         (args.cuda ? "Auto-capping CUDA sequence length" :
-                                     "Auto-capping Metal MoE sequence length"),
+                        (args.rocm ? "Auto-capping ROCm sequence length" :
+                                     "Auto-capping Metal MoE sequence length")),
                         "seq", "4096", "override", "--maxseq");
         }
     }
@@ -951,6 +959,42 @@ int main(int argc, char **argv) {
 #else
     if (args.cuda) {
         SH_LOG_WARN("--cuda requires BN_ENABLE_CUDA=1 build, falling back to CPU");
+    }
+#endif
+
+    // ROCm backend (optional)
+#ifdef BN_ENABLE_ROCM
+    if (args.rocm) {
+        BnGPUBackend *gpu = bn_gpu_rocm_create();
+        if (gpu) {
+            double gpu_t0 = bn_platform_time_ms();
+            if (bn_model_upload_weights(&model, gpu) == 0) {
+                char ms[16];
+                snprintf(ms, sizeof(ms), "%.0f", bn_platform_time_ms() - gpu_t0);
+                SH_LOG_INFO("ROCm weights uploaded", "ms", ms);
+                if (gpu->init_activations) {
+                    if (gpu->init_activations(gpu->ctx, &model.config) == 0) {
+                        SH_LOG_INFO("ROCm activations initialized");
+                    } else {
+                        SH_LOG_WARN("ROCm activation initialization failed, falling back to CPU");
+                        bn_model_release_gpu(&model);
+                        bn_gpu_rocm_destroy(gpu);
+                        gpu = NULL;
+                    }
+                }
+                if (gpu)
+                    maybe_create_gpu_moe_cache(&model, &args, gpu);
+            } else {
+                SH_LOG_WARN("ROCm weight upload failed, falling back to CPU");
+                bn_gpu_rocm_destroy(gpu);
+            }
+        } else {
+            SH_LOG_WARN("No ROCm device available, falling back to CPU");
+        }
+    }
+#else
+    if (args.rocm) {
+        SH_LOG_WARN("--rocm requires BN_ENABLE_ROCM=1 build, falling back to CPU");
     }
 #endif
 
@@ -1392,7 +1436,7 @@ int main(int argc, char **argv) {
         bn_moe_cache_free(bn_model_moe_cache(&model));
         bn_model_set_moe_cache(&model, NULL);
     }
-#if defined(BN_ENABLE_WEBGPU) || defined(BN_ENABLE_METAL) || defined(BN_ENABLE_CUDA)
+#if defined(BN_ENABLE_WEBGPU) || defined(BN_ENABLE_METAL) || defined(BN_ENABLE_CUDA) || defined(BN_ENABLE_ROCM)
     if (bn_model_gpu_moe_cache(&model)) {
         bn_gpu_moe_cache_print_stats(bn_model_gpu_moe_cache(&model));
         bn_gpu_moe_cache_free(bn_model_gpu_moe_cache(&model));

@@ -162,14 +162,31 @@ else
   LINK := $(CC)
 endif
 
+# --- ROCm (optional: BN_ENABLE_ROCM=1) ---
+HIPCC     ?= /opt/rocm/bin/hipcc
+ROCM_ARCH ?= gfx1100
+ifdef BN_ENABLE_ROCM
+  ROCM_CFLAGS   := -DBN_ENABLE_ROCM
+  ROCM_HIPFLAGS := --offload-arch=$(ROCM_ARCH)
+  ROCM_SRCS     := src/gpu_rocm.hip
+  ROCM_OBJS     := src/gpu_rocm.o
+  ROCM_LDFLAGS  := -L/opt/rocm/lib -lamdhip64 -lrocblas -lstdc++
+else
+  ROCM_CFLAGS   :=
+  ROCM_HIPFLAGS :=
+  ROCM_SRCS     :=
+  ROCM_OBJS     :=
+  ROCM_LDFLAGS  :=
+endif
+
 SRCS = src/platform.c src/gguf.c $(QUANT_SRCS) src/turboquant.c $(MODEL_SRCS) $(MOE_SRCS) \
        $(TRANSFORMER_SRCS) src/tokenizer.c src/sampler.c \
        src/threadpool.c src/sh_arena.c src/sh_log.c src/bn_alloc.c src/session.c src/prompt_cache.c src/generate.c $(WEBGPU_SRCS) src/main.c
-CFLAGS += $(WEBGPU_CFLAGS) $(METAL_CFLAGS) $(CUDA_CFLAGS)
-LDFLAGS += $(WGPU_LIB) $(WGPU_FRAMEWORKS) $(METAL_FRAMEWORKS) $(CUDA_LDFLAGS)
-OBJS = $(SRCS:.c=.o) $(METAL_OBJS) $(CUDA_OBJS)
+CFLAGS += $(WEBGPU_CFLAGS) $(METAL_CFLAGS) $(CUDA_CFLAGS) $(ROCM_CFLAGS)
+LDFLAGS += $(WGPU_LIB) $(WGPU_FRAMEWORKS) $(METAL_FRAMEWORKS) $(CUDA_LDFLAGS) $(ROCM_LDFLAGS)
+OBJS = $(SRCS:.c=.o) $(METAL_OBJS) $(CUDA_OBJS) $(ROCM_OBJS)
 HEADERS = $(wildcard include/*.h src/*.h src/transformer/*.h)
-BUILD_CONFIG := webgpu=$(if $(BN_ENABLE_WEBGPU),1,0) metal=$(if $(BN_ENABLE_METAL),1,0) cuda=$(if $(BN_ENABLE_CUDA),1,0) cc=$(CC) nvcc=$(NVCC) cuda_arch=$(CUDA_ARCH) cflags=$(CFLAGS)
+BUILD_CONFIG := webgpu=$(if $(BN_ENABLE_WEBGPU),1,0) metal=$(if $(BN_ENABLE_METAL),1,0) cuda=$(if $(BN_ENABLE_CUDA),1,0) rocm=$(if $(BN_ENABLE_ROCM),1,0) cc=$(CC) nvcc=$(NVCC) cuda_arch=$(CUDA_ARCH) cflags=$(CFLAGS)
 BUILD_CONFIG_STAMP := .build-config
 
 .PHONY: config-check
@@ -206,6 +223,10 @@ src/transformer/%.o: src/transformer/%.c $(HEADERS)
 
 src/%.o: src/%.cu $(HEADERS)
 	$(NVCC) -O3 -std=c++11 -Iinclude $(CUDA_CFLAGS) $(CUDA_NVCCFLAGS) -c -o $@ $<
+
+# ROCm/HIP pattern rule
+src/%.o: src/%.hip $(HEADERS)
+	$(HIPCC) -O3 -std=c++11 -Iinclude $(ROCM_CFLAGS) $(ROCM_HIPFLAGS) -c -o $@ $<
 
 # Objective-C pattern rule for Metal backend
 src/%.o: src/%.m $(HEADERS)
@@ -284,7 +305,7 @@ bench_layers: CFLAGS += -DBN_BENCH_LAYERS
 bench_layers: $(BENCH_SRCS) $(BENCH_OBJS)
 	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
 
-.PHONY: debug asan bench bench_suite bench_llama_compare bench_llama_topk bench_llama_topk_server bench_cuda_compare bench_qwen_cuda_matrix bench_kernels_run bitnet_scalar bench_scalar bench_scalar_layers bench_avx2 bench_webgpu bench_layers test test_architecture test_backend_matrix test_model_matrix test_gguf test_quant test_avx512_quant test_tokenizer test_transformer test_threadpool test_safety test_arena test_prefill test_kv_f16 test_q2k test_ssm test_gguf_fuzz test_moe test_qwen36 test_qwen36_cuda test_gemma4 test_gemma4_avx2 test_gemma4_webgpu test_gemma4_cuda test_gemma4_backend_matrix test_generate test_session test_prompt_cache test_turboquant test_gpu_graph_ir test_gpu_backend test_cuda_backend test_gpu_wgpu test_gpu_validate test_coherence pgo avx2-check avx512-check fetch-wgpu clean
+.PHONY: debug asan bench bench_suite bench_llama_compare bench_llama_topk bench_llama_topk_server bench_cuda_compare bench_qwen_cuda_matrix bench_kernels_run bitnet_scalar bench_scalar bench_scalar_layers bench_avx2 bench_webgpu bench_layers test test_architecture test_backend_matrix test_model_matrix test_gguf test_quant test_avx512_quant test_tokenizer test_transformer test_threadpool test_safety test_arena test_prefill test_kv_f16 test_q2k test_ssm test_gguf_fuzz test_moe test_qwen36 test_qwen36_cuda test_qwen36_rocm test_gemma4 test_gemma4_avx2 test_gemma4_webgpu test_gemma4_cuda test_gemma4_rocm test_gemma4_backend_matrix test_generate test_session test_prompt_cache test_turboquant test_gpu_graph_ir test_gpu_backend test_cuda_backend test_rocm_backend test_gpu_wgpu test_gpu_validate test_coherence pgo avx2-check avx512-check fetch-wgpu clean
 
 bench: $(MAIN_TARGET)
 	./bench/bench_suite.sh
@@ -416,7 +437,25 @@ test_gemma4_cuda:
 	@echo "test_gemma4_cuda skipped: set BN_ENABLE_CUDA=1"
 endif
 
-test_gemma4_backend_matrix: test_gemma4 test_gemma4_avx2 test_gemma4_webgpu test_gemma4_cuda
+ifdef BN_ENABLE_ROCM
+test_qwen36_rocm: test/test_qwen36.c src/platform.c src/gguf.c $(QUANT_SRCS) src/turboquant.c $(MODEL_SRCS) $(MOE_SRCS) \
+             src/transformer.c src/gpu_moe_cache.c src/gpu_moe_bridge.c $(TRANSFORMER_BACKEND) src/tokenizer.c src/threadpool.c \
+             src/sh_arena.c src/sh_log.c src/session.c src/bn_alloc.c src/gpu_rocm.o
+	$(CC) $(CFLAGS) -DBN_QWEN36_TEST_ROCM -o $@ $^ $(LDFLAGS) && ./$@
+
+test_gemma4_rocm: test/test_gemma4.c src/platform.c src/gguf.c $(QUANT_SRCS) src/turboquant.c $(MODEL_SRCS) $(MOE_SRCS) \
+             src/transformer.c src/gpu_moe_cache.c src/gpu_moe_bridge.c $(TRANSFORMER_BACKEND) src/tokenizer.c src/threadpool.c \
+             src/sh_arena.c src/sh_log.c src/session.c src/bn_alloc.c src/gpu_rocm.o
+	$(CC) $(CFLAGS) -DBN_GEMMA4_TEST_ROCM -o $@ $^ $(LDFLAGS) && ./$@
+else
+test_qwen36_rocm:
+	@echo "test_qwen36_rocm skipped: set BN_ENABLE_ROCM=1"
+
+test_gemma4_rocm:
+	@echo "test_gemma4_rocm skipped: set BN_ENABLE_ROCM=1"
+endif
+
+test_gemma4_backend_matrix: test_gemma4 test_gemma4_avx2 test_gemma4_webgpu test_gemma4_cuda test_gemma4_rocm
 
 test_generate: test/test_generate.c src/generate.c src/bn_alloc.c src/platform.c src/gguf.c $(QUANT_SRCS) src/turboquant.c $(MODEL_SRCS) $(MOE_SRCS) \
                src/transformer.c src/gpu_moe_cache.c src/gpu_moe_bridge.c $(TRANSFORMER_BACKEND) src/tokenizer.c src/sampler.c src/threadpool.c \
@@ -454,6 +493,14 @@ test_cuda_backend: test/test_cuda_backend.c src/gpu_cuda.o src/quant/fp16.c
 else
 test_cuda_backend:
 	@echo "test_cuda_backend skipped: set BN_ENABLE_CUDA=1"
+endif
+
+ifdef BN_ENABLE_ROCM
+test_rocm_backend: test/test_rocm_backend.c src/gpu_rocm.o src/quant/fp16.c
+	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS) && ./$@
+else
+test_rocm_backend:
+	@echo "test_rocm_backend skipped: set BN_ENABLE_ROCM=1"
 endif
 
 test_e2e: test/test_e2e.c src/platform.c src/gguf.c $(QUANT_SRCS) src/turboquant.c $(MODEL_SRCS) $(MOE_SRCS) \
