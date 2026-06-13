@@ -1,0 +1,73 @@
+// Q4_0 repacked split matvec for stacked projection buffers
+// Dispatch: (ceil(rows/32), 1, 1)
+#version 450
+
+layout(local_size_x = 256) in;
+
+layout(std430, set=0, binding=0) readonly buffer Weights { uint weights[]; };
+layout(std430, set=0, binding=1) readonly buffer X    { float x[]; };
+layout(std430, set=0, binding=2)          buffer Out0 { float out0[]; };
+layout(std430, set=0, binding=3)          buffer Out1 { float out1[]; };
+layout(std430, set=0, binding=4)          buffer Out2 { float out2[]; };
+
+layout(push_constant) uniform PC {
+    uint rows; uint cols; uint split1; uint split2;
+    uint bias_offset; uint off0; uint off1; uint off2;
+};
+
+shared float reduce_buf[256];
+
+const uint TILE_ROWS = 32u;
+const uint THREADS_PER_ROW = 8u;
+
+vec4 dq4(uint w, uint sh, float s) {
+    return s * vec4(float(int((w>>sh)&0xFu)-8),float(int((w>>(sh+4u))&0xFu)-8),
+                    float(int((w>>(sh+8u))&0xFu)-8),float(int((w>>(sh+12u))&0xFu)-8));
+}
+
+void main() {
+    uint tid = gl_LocalInvocationID.x;
+    uint row_lane = tid & 7u;
+    uint local_row = tid >> 3u;
+    uint global_row = gl_WorkGroupID.x * TILE_ROWS + local_row;
+
+    uint blocks_per_row = cols >> 5u;
+    uint total_blocks = rows * blocks_per_row;
+    float acc = 0.0;
+
+    if (global_row < rows) {
+        uint row_block_base = global_row * blocks_per_row;
+        for (uint b = row_lane; b < blocks_per_row; b += THREADS_PER_ROW) {
+            uint block_idx = row_block_base + b;
+            float s = uintBitsToFloat(weights[block_idx]);
+            uint nib_base = total_blocks + block_idx * 4u;
+            uint w0=weights[nib_base]; uint w1=weights[nib_base+1u];
+            uint w2=weights[nib_base+2u]; uint w3=weights[nib_base+3u];
+            uint elem = b * 32u;
+            vec4 x0=vec4(x[elem+0u],x[elem+1u],x[elem+2u],x[elem+3u]);
+            vec4 x1=vec4(x[elem+4u],x[elem+5u],x[elem+6u],x[elem+7u]);
+            vec4 x2=vec4(x[elem+8u],x[elem+9u],x[elem+10u],x[elem+11u]);
+            vec4 x3=vec4(x[elem+12u],x[elem+13u],x[elem+14u],x[elem+15u]);
+            vec4 x4=vec4(x[elem+16u],x[elem+17u],x[elem+18u],x[elem+19u]);
+            vec4 x5=vec4(x[elem+20u],x[elem+21u],x[elem+22u],x[elem+23u]);
+            vec4 x6=vec4(x[elem+24u],x[elem+25u],x[elem+26u],x[elem+27u]);
+            vec4 x7=vec4(x[elem+28u],x[elem+29u],x[elem+30u],x[elem+31u]);
+            acc += dot(dq4(w0,0u,s),x0)+dot(dq4(w0,16u,s),x1)+dot(dq4(w1,0u,s),x2)+dot(dq4(w1,16u,s),x3)
+                +  dot(dq4(w2,0u,s),x4)+dot(dq4(w2,16u,s),x5)+dot(dq4(w3,0u,s),x6)+dot(dq4(w3,16u,s),x7);
+        }
+    }
+
+    reduce_buf[tid] = acc; barrier();
+    uint row_base = local_row * THREADS_PER_ROW;
+    if (row_lane < 4u) { reduce_buf[row_base+row_lane] += reduce_buf[row_base+row_lane+4u]; } barrier();
+    if (row_lane < 2u) { reduce_buf[row_base+row_lane] += reduce_buf[row_base+row_lane+2u]; } barrier();
+    if (row_lane < 1u) { reduce_buf[row_base] += reduce_buf[row_base+1u]; } barrier();
+
+    if (row_lane == 0u && global_row < rows) {
+        float result = reduce_buf[row_base];
+        if (bias_offset > 0u) result += uintBitsToFloat(weights[bias_offset + global_row]);
+        if (split2 > 0u && global_row >= split2) out2[off2 + global_row - split2] = result;
+        else if (global_row >= split1) out1[off1 + global_row - split1] = result;
+        else out0[off0 + global_row] = result;
+    }
+}

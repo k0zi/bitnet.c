@@ -1,0 +1,46 @@
+// Fused Rotary Position Encoding for Q and K
+// Dispatch: (n_kv_heads + n_q_heads, 1, 1)
+#version 450
+
+layout(local_size_x = 256) in;
+
+layout(std430, set=0, binding=0) buffer Q    { float q[]; };
+layout(std430, set=0, binding=1) buffer K    { float k[]; };
+layout(std430, set=0, binding=2) readonly buffer Freq { float freq[]; };
+
+layout(push_constant) uniform PC { uint p0, p1, p2, p3, p4, p5, p6, p7; };
+
+void main() {
+    uint h = gl_WorkGroupID.x;
+    uint tid = gl_LocalInvocationID.x;
+    uint n_q_heads = p0;
+    uint head_size = p1;
+    uint pos = p2;
+    uint rope_dims = p3;
+    uint n_kv_heads = p4;
+    uint k_input_offset = p5;
+    uint total_heads = n_kv_heads + n_q_heads;
+
+    if (h >= total_heads) return;
+
+    bool is_k = (h < n_kv_heads);
+    uint base = is_k ? (k_input_offset + h * head_size) : ((h - n_kv_heads) * head_size);
+    uint half_rope = rope_dims / 2u;
+
+    for (uint i = tid; i < half_rope; i += 256u) {
+        float angle = float(pos) * freq[i];
+        float cos_a = cos(angle);
+        float sin_a = sin(angle);
+        uint idx0 = base + i;
+        uint idx1 = idx0 + half_rope;
+        if (is_k) {
+            float v0 = k[idx0], v1 = k[idx1];
+            k[idx0] = v0 * cos_a - v1 * sin_a;
+            k[idx1] = v0 * sin_a + v1 * cos_a;
+        } else {
+            float v0 = q[idx0], v1 = q[idx1];
+            q[idx0] = v0 * cos_a - v1 * sin_a;
+            q[idx1] = v0 * sin_a + v1 * cos_a;
+        }
+    }
+}

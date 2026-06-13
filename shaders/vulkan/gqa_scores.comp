@@ -1,0 +1,41 @@
+// GQA attention scores: Q*K dot products for all valid KV positions
+// Dispatch: (n_heads, 1, 1)
+#version 450
+
+layout(local_size_x = 256) in;
+
+layout(std430, set=0, binding=0) readonly buffer Q        { float q[]; };
+layout(std430, set=0, binding=1) readonly buffer KeyCache { float key_cache[]; };
+layout(std430, set=0, binding=2)          buffer Att      { float att[]; };
+
+layout(push_constant) uniform PC { uint p0, p1, p2, p3, p4, p5, p6, p7; };
+
+void main() {
+    uint h = gl_WorkGroupID.x;
+    uint tid = gl_LocalInvocationID.x;
+    uint n_heads = p0;
+    uint head_size = p1;
+    uint n_kv = p2;
+    uint kv_mul = p3;
+    uint kv_dim = p4;
+    uint seq_len = p5;
+    uint loff = p6;
+    float scale = uintBitsToFloat(p7);
+
+    if (h >= n_heads) return;
+
+    uint kv_h = h / kv_mul;
+    uint q_base = h * head_size;
+
+    for (uint i = tid; i < n_kv; i += 256u) {
+        uint k_base = loff + i * kv_dim + kv_h * head_size;
+        float dot = 0.0, comp = 0.0;
+        for (uint d = 0u; d < head_size; d++) {
+            float y = q[q_base + d] * key_cache[k_base + d] - comp;
+            float t = dot + y;
+            comp = (t - dot) - y;
+            dot = t;
+        }
+        att[h * seq_len + i] = dot * scale;
+    }
+}

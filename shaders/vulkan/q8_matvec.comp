@@ -1,0 +1,86 @@
+// Q8_0 TILED matvec — 8-bit quantization
+// Dispatch: (ceil(rows/32), n_tokens, 1)
+#version 450
+
+layout(local_size_x = 256) in;
+
+layout(std430, set=0, binding=0) readonly buffer Weights { uint weights[]; };
+layout(std430, set=0, binding=1) readonly buffer X       { float x[]; };
+layout(std430, set=0, binding=2)          buffer Out     { float out_buf[]; };
+
+layout(push_constant) uniform PC {
+    uint rows; uint cols; uint n_tokens; uint extra;
+    uint out_offset; uint _p5; uint _p6; uint _p7;
+};
+
+shared float reduce_buf[256];
+
+const uint TILE_ROWS = 32u;
+const uint THREADS_PER_ROW = 8u;
+const uint ELEMS_PER_THREAD = 4u; // 32/8
+
+float fp16_to_f32(uint bits) {
+    uint sign = (bits >> 15u) & 1u;
+    uint e = (bits >> 10u) & 0x1Fu;
+    uint mant = bits & 0x3FFu;
+    if (e == 0u) {
+        if (mant == 0u) return (sign == 1u) ? -0.0 : 0.0;
+        float val = float(mant) * 5.9604644775390625e-8;
+        return (sign == 1u) ? -val : val;
+    }
+    uint f_bits = (sign << 31u) | ((e + 112u) << 23u) | (mant << 13u);
+    return uintBitsToFloat(f_bits);
+}
+
+uint read_byte(uint byte_addr) {
+    uint word_idx = byte_addr / 4u;
+    uint byte_off = byte_addr % 4u;
+    return (weights[word_idx] >> (byte_off * 8u)) & 0xFFu;
+}
+
+int sign_extend_i8(uint val) {
+    return int(val << 24u) >> 24;
+}
+
+void main() {
+    uint tile_start = (extra > 0u) ? (gl_WorkGroupID.x + gl_WorkGroupID.y * extra) * TILE_ROWS
+                                   : gl_WorkGroupID.x * TILE_ROWS;
+    uint token = (extra > 0u) ? 0u : gl_WorkGroupID.y;
+    uint tid = gl_LocalInvocationID.x;
+
+    uint local_row = tid / THREADS_PER_ROW;
+    uint local_elem = tid % THREADS_PER_ROW;
+    uint global_row = tile_start + local_row;
+
+    uint blocks_per_row = cols / 32u;
+    uint x_base = token * cols;
+    uint row_byte_base = global_row * blocks_per_row * 34u;
+
+    float acc = 0.0;
+    if (global_row < rows) {
+        for (uint b = 0u; b < blocks_per_row; b++) {
+            uint block_byte = row_byte_base + b * 34u;
+            uint lo = read_byte(block_byte);
+            uint hi = read_byte(block_byte + 1u);
+            float scale = fp16_to_f32(lo | (hi << 8u));
+            uint qs_byte = block_byte + 2u;
+            uint elem_base = b * 32u;
+            uint my_start = local_elem * ELEMS_PER_THREAD;
+            for (uint i = 0u; i < ELEMS_PER_THREAD; i++) {
+                uint elem = my_start + i;
+                int ival = sign_extend_i8(read_byte(qs_byte + elem));
+                acc += scale * float(ival) * x[x_base + elem_base + elem];
+            }
+        }
+    }
+
+    reduce_buf[tid] = acc;
+    barrier();
+    uint row_base = local_row * THREADS_PER_ROW;
+    if (local_elem < 4u) { reduce_buf[row_base+local_elem] += reduce_buf[row_base+local_elem+4u]; } barrier();
+    if (local_elem < 2u) { reduce_buf[row_base+local_elem] += reduce_buf[row_base+local_elem+2u]; } barrier();
+    if (local_elem < 1u) { reduce_buf[row_base+local_elem] += reduce_buf[row_base+local_elem+1u]; } barrier();
+
+    if (local_elem == 0u && global_row < rows)
+        out_buf[out_offset + token * rows + global_row] = reduce_buf[row_base];
+}

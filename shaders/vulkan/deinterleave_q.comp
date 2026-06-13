@@ -1,0 +1,20 @@
+// Extract Q from interleaved [Q0, Gate0, Q1, Gate1, ...] layout
+// Dispatch: (ceil(q_dim/256), 1, 1)
+#version 450
+
+layout(local_size_x = 256) in;
+
+layout(std430, set=0, binding=0) readonly buffer Src { float src[]; };
+layout(std430, set=0, binding=1)          buffer Dst { float dst[]; };
+
+layout(push_constant) uniform PC { uint p0, p1, p2, p3, p4, p5, p6, p7; };
+
+void main() {
+    uint gid = gl_WorkGroupID.x * 256u + gl_LocalInvocationID.x;
+    uint q_dim = p0;
+    uint hs = p1;
+    if (gid >= q_dim) return;
+    uint head = gid / hs;
+    uint d = gid % hs;
+    dst[gid] = src[head * 2u * hs + d];
+}

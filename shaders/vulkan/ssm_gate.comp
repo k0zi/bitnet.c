@@ -1,0 +1,41 @@
+// Per-head RMSNorm + SiLU gate: out[d] = rmsnorm(out[d], norm_w[d]) * silu(z[d])
+// Dispatch: (num_v_heads, 1, 1)
+#version 450
+
+layout(local_size_x = 256) in;
+
+layout(std430, set=0, binding=0) buffer Out      { float out_buf[]; };
+layout(std430, set=0, binding=1) readonly buffer Z      { float z[]; };
+layout(std430, set=0, binding=2) readonly buffer NormW  { float norm_w[]; };
+
+layout(push_constant) uniform PC {
+    uint hv; uint eps_bits; uint _p2; uint _p3;
+    uint _p4; uint _p5; uint _p6; uint _p7;
+};
+
+shared float shared_sum[256];
+
+void main() {
+    uint hv_idx = gl_WorkGroupID.x;
+    uint tid = gl_LocalInvocationID.x;
+    float eps = uintBitsToFloat(eps_bits);
+    uint base = hv_idx * hv;
+
+    float ss = 0.0;
+    for (uint d = tid; d < hv; d += 256u) {
+        float val = out_buf[base + d];
+        ss += val * val;
+    }
+    shared_sum[tid] = ss; barrier();
+    for (uint s = 128u; s > 0u; s >>= 1u) {
+        if (tid < s) shared_sum[tid] += shared_sum[tid + s];
+        barrier();
+    }
+    float inv_rms = 1.0 / sqrt(shared_sum[0] / float(hv) + eps);
+    barrier();
+    for (uint d = tid; d < hv; d += 256u) {
+        float normed = out_buf[base + d] * inv_rms * norm_w[d];
+        float g = z[base + d];
+        out_buf[base + d] = normed * (g / (1.0 + exp(-g)));
+    }
+}

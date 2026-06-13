@@ -1,0 +1,41 @@
+// Per-head L2 normalization of Q and K — one workgroup per head
+// Dispatch: (num_k_heads, 1, 1)
+#version 450
+
+layout(local_size_x = 256) in;
+
+layout(std430, set=0, binding=0) buffer Q { float q[]; };
+layout(std430, set=0, binding=1) buffer K { float k[]; };
+
+layout(push_constant) uniform PC {
+    uint hd; uint q_off; uint k_off; uint _p3;
+    uint _p4; uint _p5; uint _p6; uint _p7;
+};
+
+shared float shared_q[256];
+shared float shared_k[256];
+
+void main() {
+    uint head = gl_WorkGroupID.x;
+    uint tid = gl_LocalInvocationID.x;
+    uint qb = q_off + head * hd;
+    uint kb = k_off + head * hd;
+
+    float qn = 0.0, kn = 0.0;
+    for (uint d = tid; d < hd; d += 256u) {
+        float qv = q[qb + d], kv = k[kb + d];
+        qn += qv * qv; kn += kv * kv;
+    }
+    shared_q[tid] = qn; shared_k[tid] = kn; barrier();
+    for (uint s = 128u; s > 0u; s >>= 1u) {
+        if (tid < s) { shared_q[tid] += shared_q[tid + s]; shared_k[tid] += shared_k[tid + s]; }
+        barrier();
+    }
+    float inv_qn = 1.0 / (sqrt(shared_q[0]) + 1e-6);
+    float inv_kn = 1.0 / (sqrt(shared_k[0]) + 1e-6);
+    barrier();
+    for (uint d = tid; d < hd; d += 256u) {
+        q[qb + d] *= inv_qn;
+        k[kb + d] *= inv_kn;
+    }
+}

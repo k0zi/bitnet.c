@@ -1,0 +1,100 @@
+// Q5_K split matvec for stacked QKV buffers
+// Dispatch: (ceil(rows/32), 1, 1)
+#version 450
+
+layout(local_size_x = 256) in;
+
+layout(std430, set=0, binding=0) readonly buffer Weights { uint weights[]; };
+layout(std430, set=0, binding=1) readonly buffer X    { float x[]; };
+layout(std430, set=0, binding=2)          buffer Out0 { float out0[]; };
+layout(std430, set=0, binding=3)          buffer Out1 { float out1[]; };
+layout(std430, set=0, binding=4)          buffer Out2 { float out2[]; };
+
+layout(push_constant) uniform PC {
+    uint rows; uint cols; uint split1; uint split2;
+    uint _p4; uint off0; uint off1; uint off2;
+};
+
+shared float reduce_buf[256];
+
+const uint TILE_ROWS = 32u;
+const uint THREADS_PER_ROW = 8u;
+const uint ELEMS_PER_THREAD = 32u;
+const uint QK_K = 256u;
+const uint BLOCK_BYTES = 176u;
+
+float fp16_to_f32(uint b){uint s=(b>>15u)&1u;uint e=(b>>10u)&0x1Fu;uint m=b&0x3FFu;if(e==0u){if(m==0u)return(s==1u)?-0.0:0.0;float v=float(m)*5.9604644775390625e-8;return(s==1u)?-v:v;}return uintBitsToFloat((s<<31u)|((e+112u)<<23u)|(m<<13u));}
+uint read_u8(uint o){return(weights[o>>2u]>>((o&3u)*8u))&0xFFu;}
+uint read_u16(uint o){return(weights[o>>2u]>>((o&2u)*8u))&0xFFFFu;}
+
+uvec2 get_scale_min(uint j,uint sb){
+    uint sc,m;
+    if(j<4u){sc=read_u8(sb+j)&63u;m=read_u8(sb+j+4u)&63u;}
+    else{sc=(read_u8(sb+j+4u)&0xFu)|((read_u8(sb+j-4u)>>6u)<<4u);m=(read_u8(sb+j+4u)>>4u)|((read_u8(sb+j)>>6u)<<4u);}
+    return uvec2(sc,m);
+}
+float q5_value(uint qbyte,uint hbyte,uint bit,bool is_high){
+    uint nibble=is_high?(qbyte>>4u):(qbyte&0xFu);
+    return float(nibble|((( hbyte>>bit)&1u)<<4u));
+}
+
+void main(){
+    uint tile_start=gl_WorkGroupID.x*TILE_ROWS;
+    uint tid=gl_LocalInvocationID.x;
+    uint local_row=tid/THREADS_PER_ROW; uint local_elem=tid%THREADS_PER_ROW;
+    uint global_row=tile_start+local_row;
+    uint n_blocks=cols/QK_K;
+    uint row_byte=global_row*n_blocks*BLOCK_BYTES;
+    uint my_start=local_elem*ELEMS_PER_THREAD;
+    uint group=my_start/64u; uint is_high_u=(my_start%64u)/32u;
+    bool is_hi=(is_high_u!=0u); uint bit=group*2u+is_high_u;
+    uint q_off_base=group*32u;
+
+    float acc=0.0;
+    if(global_row<rows){
+        for(uint bi=0u;bi<n_blocks;bi++){
+            uint base=row_byte+bi*BLOCK_BYTES;
+            float d=fp16_to_f32(read_u16(base)); float dmin=fp16_to_f32(read_u16(base+2u));
+            uint scales_base=base+4u; uint qh_base=base+16u; uint qs_base=base+48u;
+            uint elem_base=bi*QK_K;
+            uvec2 sm=get_scale_min(bit,scales_base);
+            float ds=d*float(sm.x); float dm=dmin*float(sm.y);
+            uint q_off=qs_base+q_off_base;
+            uint xb=elem_base+my_start;
+
+            vec4 q0=vec4(q5_value(read_u8(q_off+0u),read_u8(qh_base+0u),bit,is_hi),q5_value(read_u8(q_off+1u),read_u8(qh_base+1u),bit,is_hi),q5_value(read_u8(q_off+2u),read_u8(qh_base+2u),bit,is_hi),q5_value(read_u8(q_off+3u),read_u8(qh_base+3u),bit,is_hi));
+            vec4 q1=vec4(q5_value(read_u8(q_off+4u),read_u8(qh_base+4u),bit,is_hi),q5_value(read_u8(q_off+5u),read_u8(qh_base+5u),bit,is_hi),q5_value(read_u8(q_off+6u),read_u8(qh_base+6u),bit,is_hi),q5_value(read_u8(q_off+7u),read_u8(qh_base+7u),bit,is_hi));
+            vec4 q2=vec4(q5_value(read_u8(q_off+8u),read_u8(qh_base+8u),bit,is_hi),q5_value(read_u8(q_off+9u),read_u8(qh_base+9u),bit,is_hi),q5_value(read_u8(q_off+10u),read_u8(qh_base+10u),bit,is_hi),q5_value(read_u8(q_off+11u),read_u8(qh_base+11u),bit,is_hi));
+            vec4 q3=vec4(q5_value(read_u8(q_off+12u),read_u8(qh_base+12u),bit,is_hi),q5_value(read_u8(q_off+13u),read_u8(qh_base+13u),bit,is_hi),q5_value(read_u8(q_off+14u),read_u8(qh_base+14u),bit,is_hi),q5_value(read_u8(q_off+15u),read_u8(qh_base+15u),bit,is_hi));
+            vec4 q4=vec4(q5_value(read_u8(q_off+16u),read_u8(qh_base+16u),bit,is_hi),q5_value(read_u8(q_off+17u),read_u8(qh_base+17u),bit,is_hi),q5_value(read_u8(q_off+18u),read_u8(qh_base+18u),bit,is_hi),q5_value(read_u8(q_off+19u),read_u8(qh_base+19u),bit,is_hi));
+            vec4 q5_v=vec4(q5_value(read_u8(q_off+20u),read_u8(qh_base+20u),bit,is_hi),q5_value(read_u8(q_off+21u),read_u8(qh_base+21u),bit,is_hi),q5_value(read_u8(q_off+22u),read_u8(qh_base+22u),bit,is_hi),q5_value(read_u8(q_off+23u),read_u8(qh_base+23u),bit,is_hi));
+            vec4 q6=vec4(q5_value(read_u8(q_off+24u),read_u8(qh_base+24u),bit,is_hi),q5_value(read_u8(q_off+25u),read_u8(qh_base+25u),bit,is_hi),q5_value(read_u8(q_off+26u),read_u8(qh_base+26u),bit,is_hi),q5_value(read_u8(q_off+27u),read_u8(qh_base+27u),bit,is_hi));
+            vec4 q7=vec4(q5_value(read_u8(q_off+28u),read_u8(qh_base+28u),bit,is_hi),q5_value(read_u8(q_off+29u),read_u8(qh_base+29u),bit,is_hi),q5_value(read_u8(q_off+30u),read_u8(qh_base+30u),bit,is_hi),q5_value(read_u8(q_off+31u),read_u8(qh_base+31u),bit,is_hi));
+
+            vec4 x0=vec4(x[xb+0u],x[xb+1u],x[xb+2u],x[xb+3u]);
+            vec4 x1=vec4(x[xb+4u],x[xb+5u],x[xb+6u],x[xb+7u]);
+            vec4 x2=vec4(x[xb+8u],x[xb+9u],x[xb+10u],x[xb+11u]);
+            vec4 x3=vec4(x[xb+12u],x[xb+13u],x[xb+14u],x[xb+15u]);
+            vec4 x4=vec4(x[xb+16u],x[xb+17u],x[xb+18u],x[xb+19u]);
+            vec4 x5=vec4(x[xb+20u],x[xb+21u],x[xb+22u],x[xb+23u]);
+            vec4 x6=vec4(x[xb+24u],x[xb+25u],x[xb+26u],x[xb+27u]);
+            vec4 x7=vec4(x[xb+28u],x[xb+29u],x[xb+30u],x[xb+31u]);
+
+            acc+=ds*(dot(q0,x0)+dot(q1,x1)+dot(q2,x2)+dot(q3,x3)+dot(q4,x4)+dot(q5_v,x5)+dot(q6,x6)+dot(q7,x7))
+               -dm*(dot(x0,vec4(1))+dot(x1,vec4(1))+dot(x2,vec4(1))+dot(x3,vec4(1))+dot(x4,vec4(1))+dot(x5,vec4(1))+dot(x6,vec4(1))+dot(x7,vec4(1)));
+        }
+    }
+
+    reduce_buf[tid]=acc; barrier();
+    uint row_base=local_row*THREADS_PER_ROW;
+    if(local_elem<4u){reduce_buf[row_base+local_elem]+=reduce_buf[row_base+local_elem+4u];}barrier();
+    if(local_elem<2u){reduce_buf[row_base+local_elem]+=reduce_buf[row_base+local_elem+2u];}barrier();
+    if(local_elem<1u){reduce_buf[row_base+local_elem]+=reduce_buf[row_base+local_elem+1u];}barrier();
+
+    if(local_elem==0u&&global_row<rows){
+        float result=reduce_buf[row_base];
+        if(split2>0u&&global_row>=split2) out2[off2+global_row-split2]=result;
+        else if(global_row>=split1) out1[off1+global_row-split1]=result;
+        else out0[off0+global_row]=result;
+    }
+}

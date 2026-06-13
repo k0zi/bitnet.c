@@ -1,0 +1,26 @@
+// SSM decay/update from stacked [alpha|beta] matvec output
+// Dispatch: (1, 1, 1) — p0 threads active
+#version 450
+
+layout(local_size_x = 256) in;
+
+layout(std430, set=0, binding=0) readonly buffer Src    { float src[]; };
+layout(std430, set=0, binding=1) buffer Alpha           { float alpha[]; };
+layout(std430, set=0, binding=2) buffer Beta            { float beta[]; };
+layout(std430, set=0, binding=3) readonly buffer DtBias { float dt_bias[]; };
+layout(std430, set=0, binding=4) readonly buffer ALog   { float a_log[]; };
+
+layout(push_constant) uniform PC {
+    uint n; uint beta_off; uint _p2; uint _p3;
+    uint _p4; uint _p5; uint _p6; uint _p7;
+};
+
+void main() {
+    uint h = gl_LocalInvocationID.x;
+    if (h >= n) return;
+    float dt = src[h] + dt_bias[h];
+    float dt_sp = (dt > 20.0) ? dt : log(1.0 + exp(dt));
+    alpha[h] = exp(dt_sp * a_log[h]);
+    float b = src[beta_off + h];
+    beta[h] = 1.0 / (1.0 + exp(-b));
+}

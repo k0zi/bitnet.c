@@ -9,6 +9,7 @@ typedef enum {
     BN_GPU_BACKEND_METAL = 1,
     BN_GPU_BACKEND_WEBGPU = 2,
     BN_GPU_BACKEND_CUDA = 3,
+    BN_GPU_BACKEND_VULKAN = 4,
 } BnGPUBackendKind;
 
 // Descriptor for one operation in a batched matvec submission.

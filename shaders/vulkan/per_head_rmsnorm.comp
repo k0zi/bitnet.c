@@ -1,0 +1,44 @@
+// Per-head RMS normalization
+// Dispatch: (n_heads, 1, 1)
+#version 450
+
+layout(local_size_x = 256) in;
+
+layout(std430, set=0, binding=0) buffer X      { float x[]; };
+layout(std430, set=0, binding=1) readonly buffer W { float weight[]; };
+
+layout(push_constant) uniform PC { uint p0, p1, p2, p3, p4, p5, p6, p7; };
+
+shared float shared_sum[256];
+
+void main() {
+    uint head = gl_WorkGroupID.x;
+    uint tid = gl_LocalInvocationID.x;
+    uint hs = p0;
+    float eps = uintBitsToFloat(p1);
+    uint per_head = p2;
+    uint input_offset = p3;
+    uint x_base = input_offset + head * hs;
+    uint w_base = (per_head != 0u) ? head * hs : 0u;
+
+    float ss = 0.0, comp = 0.0;
+    for (uint d = tid; d < hs; d += 256u) {
+        float v = x[x_base + d];
+        float y = v * v - comp;
+        float t = ss + y;
+        comp = (t - ss) - y;
+        ss = t;
+    }
+    shared_sum[tid] = ss;
+    barrier();
+    for (uint s = 128u; s > 0u; s >>= 1u) {
+        if (tid < s) shared_sum[tid] += shared_sum[tid + s];
+        barrier();
+    }
+
+    float scale = 1.0 / sqrt(shared_sum[0] / float(hs) + eps);
+    barrier();
+
+    for (uint d = tid; d < hs; d += 256u)
+        x[x_base + d] = x[x_base + d] * weight[w_base + d] * scale;
+}

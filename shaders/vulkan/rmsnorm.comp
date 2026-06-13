@@ -1,0 +1,44 @@
+// RMS normalization: out[i] = x[i] * weight[i] / sqrt(mean(x^2) + eps)
+// Dispatch: (1, 1, 1)
+#version 450
+
+layout(local_size_x = 256) in;
+
+layout(std430, set=0, binding=0) readonly buffer X    { float x[]; };
+layout(std430, set=0, binding=1) readonly buffer W    { float weight[]; };
+layout(std430, set=0, binding=2)          buffer Out  { float out_buf[]; };
+
+layout(push_constant) uniform PC { uint p0, p1, p2, p3, p4, p5, p6, p7; };
+
+shared float shared_mem[256];
+
+void main() {
+    uint tid = gl_LocalInvocationID.x;
+    uint dim = p0;
+    float eps = uintBitsToFloat(p1);
+
+    float sum_sq = 0.0, comp = 0.0;
+    for (uint i = tid; i < dim; i += 256u) {
+        float v = x[i];
+        float y = v * v - comp;
+        float t = sum_sq + y;
+        comp = (t - sum_sq) - y;
+        sum_sq = t;
+    }
+
+    shared_mem[tid] = sum_sq;
+    barrier();
+    for (uint s = 128u; s > 0u; s >>= 1u) {
+        if (tid < s) shared_mem[tid] += shared_mem[tid + s];
+        barrier();
+    }
+
+    if (tid == 0u) shared_mem[0] = 1.0 / sqrt(shared_mem[0] / float(dim) + eps);
+    barrier();
+
+    float scale = shared_mem[0];
+    for (uint i = tid; i < dim; i += 256u) {
+        float v = x[i];
+        out_buf[i] = v * weight[i] * scale;
+    }
+}

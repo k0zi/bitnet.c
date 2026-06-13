@@ -1,0 +1,60 @@
+// F32 TILED matvec
+// Dispatch: (ceil(rows/32), n_tokens, 1)
+#version 450
+
+layout(local_size_x = 256) in;
+
+layout(std430, set=0, binding=0) readonly buffer Weights { uint weights[]; };
+layout(std430, set=0, binding=1) readonly buffer X       { float x[]; };
+layout(std430, set=0, binding=2)          buffer Out     { float out_buf[]; };
+
+layout(push_constant) uniform PC {
+    uint rows; uint cols; uint n_tokens; uint extra;
+    uint out_offset; uint _p5; uint _p6; uint _p7;
+};
+
+shared float reduce_buf[256];
+
+const uint TILE_ROWS = 32u;
+const uint THREADS_PER_ROW = 8u;
+const uint ELEMS_PER_THREAD = 32u; // 256/8
+const uint BLOCK_SIZE = 256u;
+
+void main() {
+    uint tile_start = (extra > 0u) ? (gl_WorkGroupID.x + gl_WorkGroupID.y * extra) * TILE_ROWS
+                                   : gl_WorkGroupID.x * TILE_ROWS;
+    uint token = (extra > 0u) ? 0u : gl_WorkGroupID.y;
+    uint tid = gl_LocalInvocationID.x;
+
+    uint local_row = tid / THREADS_PER_ROW;
+    uint local_elem = tid % THREADS_PER_ROW;
+    uint global_row = tile_start + local_row;
+
+    uint blocks_per_row = cols / BLOCK_SIZE;
+    uint x_base = token * cols;
+    uint w_base = global_row * cols;
+
+    float acc = 0.0;
+    if (global_row < rows) {
+        for (uint b = 0u; b < blocks_per_row; b++) {
+            uint elem_base = b * BLOCK_SIZE;
+            uint my_start = local_elem * ELEMS_PER_THREAD;
+            for (uint i = 0u; i < ELEMS_PER_THREAD; i++) {
+                uint elem = my_start + i;
+                float w = uintBitsToFloat(weights[w_base + elem_base + elem]);
+                acc += w * x[x_base + elem_base + elem];
+            }
+        }
+    }
+
+    reduce_buf[tid] = acc;
+    barrier();
+
+    uint row_base = local_row * THREADS_PER_ROW;
+    if (local_elem < 4u) { reduce_buf[row_base + local_elem] += reduce_buf[row_base + local_elem + 4u]; barrier(); }
+    if (local_elem < 2u) { reduce_buf[row_base + local_elem] += reduce_buf[row_base + local_elem + 2u]; barrier(); }
+    if (local_elem < 1u) { reduce_buf[row_base + local_elem] += reduce_buf[row_base + local_elem + 1u]; barrier(); }
+
+    if (local_elem == 0u && global_row < rows)
+        out_buf[out_offset + token * rows + global_row] = reduce_buf[row_base];
+}

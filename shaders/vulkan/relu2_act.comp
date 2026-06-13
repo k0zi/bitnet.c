@@ -1,0 +1,16 @@
+// In-place ReLU^2 activation: x[i] = max(0, x[i])^2
+#version 450
+
+layout(local_size_x = 256) in;
+
+layout(std430, set=0, binding=0) buffer X { float x[]; };
+
+layout(push_constant) uniform PC { uint p0, p1, p2, p3, p4, p5, p6, p7; };
+
+void main() {
+    uint gid = gl_WorkGroupID.x * 256u + gl_LocalInvocationID.x;
+    uint dim = p0;
+    if (gid >= dim) return;
+    float v = max(0.0, x[gid]);
+    x[gid] = v * v;
+}

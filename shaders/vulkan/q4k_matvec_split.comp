@@ -1,0 +1,133 @@
+// Q4_K split matvec for stacked gate+up buffers
+// Dispatch: (ceil(rows/32), 1, 1)
+#version 450
+
+layout(local_size_x = 256) in;
+
+layout(std430, set=0, binding=0) readonly buffer Weights { uint weights[]; };
+layout(std430, set=0, binding=1) readonly buffer X    { float x[]; };
+layout(std430, set=0, binding=2)          buffer Out0 { float out0[]; };
+layout(std430, set=0, binding=3)          buffer Out1 { float out1[]; };
+
+layout(push_constant) uniform PC {
+    uint rows; uint cols; uint split; uint fused_silu;
+    uint _p4; uint _p5; uint _p6; uint _p7;
+};
+
+shared float reduce_buf[256];
+shared float reduce_buf2[256];
+
+const uint TILE_ROWS = 32u;
+const uint THREADS_PER_ROW = 8u;
+const uint ELEMS_PER_THREAD = 32u;
+const uint QK_K = 256u;
+const uint BLOCK_BYTES = 144u;
+
+float fp16_to_f32(uint b){uint s=(b>>15u)&1u;uint e=(b>>10u)&0x1Fu;uint m=b&0x3FFu;if(e==0u){if(m==0u)return(s==1u)?-0.0:0.0;float v=float(m)*5.9604644775390625e-8;return(s==1u)?-v:v;}return uintBitsToFloat((s<<31u)|((e+112u)<<23u)|(m<<13u));}
+uint read_u8(uint o){return(weights[o>>2u]>>((o&3u)*8u))&0xFFu;}
+uint read_u16(uint o){return(weights[o>>2u]>>((o&2u)*8u))&0xFFFFu;}
+uint byte_at(uint w,uint i){return(w>>(i*8u))&0xFFu;}
+
+uvec2 get_scale_min(uint j,uint sb){
+    uint sc,m;
+    if(j<4u){sc=read_u8(sb+j)&63u;m=read_u8(sb+j+4u)&63u;}
+    else{sc=(read_u8(sb+j+4u)&0xFu)|((read_u8(sb+j-4u)>>6u)<<4u);m=(read_u8(sb+j+4u)>>4u)|((read_u8(sb+j)>>6u)<<4u);}
+    return uvec2(sc,m);
+}
+float q4_value(uint qbyte,bool is_high){return is_high?float(qbyte>>4u):float(qbyte&0xFu);}
+
+void main(){
+    uint tile_start=gl_WorkGroupID.x*TILE_ROWS;
+    uint tid=gl_LocalInvocationID.x;
+    uint local_row=tid/THREADS_PER_ROW; uint local_elem=tid%THREADS_PER_ROW;
+    uint global_row=tile_start+local_row;
+    uint n_blocks=cols/QK_K;
+    uint row_byte=global_row*n_blocks*BLOCK_BYTES;
+    uint my_start=local_elem*ELEMS_PER_THREAD;
+    uint group=my_start/64u; uint is_high_u=(my_start%64u)/32u;
+    bool is_hi=(is_high_u!=0u); uint sub=group*2u+is_high_u;
+
+    float acc=0.0, acc2=0.0;
+    if(global_row<rows){
+        for(uint bi=0u;bi<n_blocks;bi++){
+            uint base=row_byte+bi*BLOCK_BYTES;
+            float d=fp16_to_f32(read_u16(base)); float dmin=fp16_to_f32(read_u16(base+2u));
+            uint scales_base=base+4u; uint qs_base=base+16u; uint elem_base=bi*QK_K;
+            uvec2 sm=get_scale_min(sub,scales_base);
+            uint q_off_base=qs_base+group*32u;
+            uint xb=elem_base+my_start;
+            uint qw0=weights[(q_off_base+0u)>>2u]; uint qw1=weights[(q_off_base+4u)>>2u];
+            uint qw2=weights[(q_off_base+8u)>>2u]; uint qw3=weights[(q_off_base+12u)>>2u];
+            uint qw4=weights[(q_off_base+16u)>>2u]; uint qw5=weights[(q_off_base+20u)>>2u];
+            uint qw6=weights[(q_off_base+24u)>>2u]; uint qw7=weights[(q_off_base+28u)>>2u];
+            vec4 q0=vec4(q4_value(byte_at(qw0,0u),is_hi),q4_value(byte_at(qw0,1u),is_hi),q4_value(byte_at(qw0,2u),is_hi),q4_value(byte_at(qw0,3u),is_hi));
+            vec4 q1=vec4(q4_value(byte_at(qw1,0u),is_hi),q4_value(byte_at(qw1,1u),is_hi),q4_value(byte_at(qw1,2u),is_hi),q4_value(byte_at(qw1,3u),is_hi));
+            vec4 q2=vec4(q4_value(byte_at(qw2,0u),is_hi),q4_value(byte_at(qw2,1u),is_hi),q4_value(byte_at(qw2,2u),is_hi),q4_value(byte_at(qw2,3u),is_hi));
+            vec4 q3=vec4(q4_value(byte_at(qw3,0u),is_hi),q4_value(byte_at(qw3,1u),is_hi),q4_value(byte_at(qw3,2u),is_hi),q4_value(byte_at(qw3,3u),is_hi));
+            vec4 q4=vec4(q4_value(byte_at(qw4,0u),is_hi),q4_value(byte_at(qw4,1u),is_hi),q4_value(byte_at(qw4,2u),is_hi),q4_value(byte_at(qw4,3u),is_hi));
+            vec4 q5=vec4(q4_value(byte_at(qw5,0u),is_hi),q4_value(byte_at(qw5,1u),is_hi),q4_value(byte_at(qw5,2u),is_hi),q4_value(byte_at(qw5,3u),is_hi));
+            vec4 q6=vec4(q4_value(byte_at(qw6,0u),is_hi),q4_value(byte_at(qw6,1u),is_hi),q4_value(byte_at(qw6,2u),is_hi),q4_value(byte_at(qw6,3u),is_hi));
+            vec4 q7=vec4(q4_value(byte_at(qw7,0u),is_hi),q4_value(byte_at(qw7,1u),is_hi),q4_value(byte_at(qw7,2u),is_hi),q4_value(byte_at(qw7,3u),is_hi));
+            vec4 x0=vec4(x[xb+0u],x[xb+1u],x[xb+2u],x[xb+3u]);
+            vec4 x1=vec4(x[xb+4u],x[xb+5u],x[xb+6u],x[xb+7u]);
+            vec4 x2=vec4(x[xb+8u],x[xb+9u],x[xb+10u],x[xb+11u]);
+            vec4 x3=vec4(x[xb+12u],x[xb+13u],x[xb+14u],x[xb+15u]);
+            vec4 x4=vec4(x[xb+16u],x[xb+17u],x[xb+18u],x[xb+19u]);
+            vec4 x5=vec4(x[xb+20u],x[xb+21u],x[xb+22u],x[xb+23u]);
+            vec4 x6=vec4(x[xb+24u],x[xb+25u],x[xb+26u],x[xb+27u]);
+            vec4 x7=vec4(x[xb+28u],x[xb+29u],x[xb+30u],x[xb+31u]);
+            float sum_x=dot(x0,vec4(1))+dot(x1,vec4(1))+dot(x2,vec4(1))+dot(x3,vec4(1))+dot(x4,vec4(1))+dot(x5,vec4(1))+dot(x6,vec4(1))+dot(x7,vec4(1));
+            float sum_qx=dot(q0,x0)+dot(q1,x1)+dot(q2,x2)+dot(q3,x3)+dot(q4,x4)+dot(q5,x5)+dot(q6,x6)+dot(q7,x7);
+            acc+=d*float(sm.x)*sum_qx-dmin*float(sm.y)*sum_x;
+        }
+        // Process up-half for fused mode
+        if(fused_silu!=0u&&global_row<split){
+            uint up_row=global_row+split;
+            uint up_row_byte=up_row*n_blocks*BLOCK_BYTES;
+            for(uint bi=0u;bi<n_blocks;bi++){
+                uint base=up_row_byte+bi*BLOCK_BYTES;
+                float d=fp16_to_f32(read_u16(base)); float dmin=fp16_to_f32(read_u16(base+2u));
+                uint scales_base=base+4u; uint qs_base=base+16u; uint elem_base=bi*QK_K;
+                uvec2 sm=get_scale_min(sub,scales_base);
+                uint q_off_base=qs_base+group*32u;
+                uint xb=elem_base+my_start;
+                uint qw0=weights[(q_off_base+0u)>>2u]; uint qw1=weights[(q_off_base+4u)>>2u];
+                uint qw2=weights[(q_off_base+8u)>>2u]; uint qw3=weights[(q_off_base+12u)>>2u];
+                uint qw4=weights[(q_off_base+16u)>>2u]; uint qw5=weights[(q_off_base+20u)>>2u];
+                uint qw6=weights[(q_off_base+24u)>>2u]; uint qw7=weights[(q_off_base+28u)>>2u];
+                vec4 q0=vec4(q4_value(byte_at(qw0,0u),is_hi),q4_value(byte_at(qw0,1u),is_hi),q4_value(byte_at(qw0,2u),is_hi),q4_value(byte_at(qw0,3u),is_hi));
+                vec4 q1=vec4(q4_value(byte_at(qw1,0u),is_hi),q4_value(byte_at(qw1,1u),is_hi),q4_value(byte_at(qw1,2u),is_hi),q4_value(byte_at(qw1,3u),is_hi));
+                vec4 q2=vec4(q4_value(byte_at(qw2,0u),is_hi),q4_value(byte_at(qw2,1u),is_hi),q4_value(byte_at(qw2,2u),is_hi),q4_value(byte_at(qw2,3u),is_hi));
+                vec4 q3=vec4(q4_value(byte_at(qw3,0u),is_hi),q4_value(byte_at(qw3,1u),is_hi),q4_value(byte_at(qw3,2u),is_hi),q4_value(byte_at(qw3,3u),is_hi));
+                vec4 q4=vec4(q4_value(byte_at(qw4,0u),is_hi),q4_value(byte_at(qw4,1u),is_hi),q4_value(byte_at(qw4,2u),is_hi),q4_value(byte_at(qw4,3u),is_hi));
+                vec4 q5=vec4(q4_value(byte_at(qw5,0u),is_hi),q4_value(byte_at(qw5,1u),is_hi),q4_value(byte_at(qw5,2u),is_hi),q4_value(byte_at(qw5,3u),is_hi));
+                vec4 q6=vec4(q4_value(byte_at(qw6,0u),is_hi),q4_value(byte_at(qw6,1u),is_hi),q4_value(byte_at(qw6,2u),is_hi),q4_value(byte_at(qw6,3u),is_hi));
+                vec4 q7=vec4(q4_value(byte_at(qw7,0u),is_hi),q4_value(byte_at(qw7,1u),is_hi),q4_value(byte_at(qw7,2u),is_hi),q4_value(byte_at(qw7,3u),is_hi));
+                vec4 x0=vec4(x[xb+0u],x[xb+1u],x[xb+2u],x[xb+3u]);
+                vec4 x1=vec4(x[xb+4u],x[xb+5u],x[xb+6u],x[xb+7u]);
+                vec4 x2=vec4(x[xb+8u],x[xb+9u],x[xb+10u],x[xb+11u]);
+                vec4 x3=vec4(x[xb+12u],x[xb+13u],x[xb+14u],x[xb+15u]);
+                vec4 x4=vec4(x[xb+16u],x[xb+17u],x[xb+18u],x[xb+19u]);
+                vec4 x5=vec4(x[xb+20u],x[xb+21u],x[xb+22u],x[xb+23u]);
+                vec4 x6=vec4(x[xb+24u],x[xb+25u],x[xb+26u],x[xb+27u]);
+                vec4 x7=vec4(x[xb+28u],x[xb+29u],x[xb+30u],x[xb+31u]);
+                float sum_x=dot(x0,vec4(1))+dot(x1,vec4(1))+dot(x2,vec4(1))+dot(x3,vec4(1))+dot(x4,vec4(1))+dot(x5,vec4(1))+dot(x6,vec4(1))+dot(x7,vec4(1));
+                float sum_qx=dot(q0,x0)+dot(q1,x1)+dot(q2,x2)+dot(q3,x3)+dot(q4,x4)+dot(q5,x5)+dot(q6,x6)+dot(q7,x7);
+                acc2+=d*float(sm.x)*sum_qx-dmin*float(sm.y)*sum_x;
+            }
+        }
+    }
+
+    reduce_buf[tid]=acc; reduce_buf2[tid]=acc2; barrier();
+    uint row_base=local_row*THREADS_PER_ROW;
+    if(local_elem<4u){reduce_buf[row_base+local_elem]+=reduce_buf[row_base+local_elem+4u];reduce_buf2[row_base+local_elem]+=reduce_buf2[row_base+local_elem+4u];}barrier();
+    if(local_elem<2u){reduce_buf[row_base+local_elem]+=reduce_buf[row_base+local_elem+2u];reduce_buf2[row_base+local_elem]+=reduce_buf2[row_base+local_elem+2u];}barrier();
+    if(local_elem<1u){reduce_buf[row_base]+=reduce_buf[row_base+1u];reduce_buf2[row_base]+=reduce_buf2[row_base+1u];}barrier();
+
+    if(local_elem==0u&&global_row<rows){
+        if(fused_silu!=0u){
+            if(global_row<split){float g=reduce_buf[row_base];out0[global_row]=(g/(1.0+exp(-g)))*reduce_buf2[row_base];}
+        } else if(global_row>=split){out1[global_row-split]=reduce_buf[row_base];}
+        else{out0[global_row]=reduce_buf[row_base];}
+    }
+}

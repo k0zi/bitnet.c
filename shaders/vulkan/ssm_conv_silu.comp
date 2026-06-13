@@ -1,0 +1,28 @@
+// Conv1d (kernel=p1) + SiLU + conv_state shift — one thread per channel
+// Dispatch: (ceil(qkv_dim/256), 1, 1)
+#version 450
+
+layout(local_size_x = 256) in;
+
+layout(std430, set=0, binding=0) buffer QKV       { float qkv[]; };
+layout(std430, set=0, binding=1) buffer ConvState { float conv_state[]; };
+layout(std430, set=0, binding=2) readonly buffer ConvW { float conv1d_w[]; };
+
+layout(push_constant) uniform PC {
+    uint qkv_dim; uint kern; uint cs_off; uint cs_layer_size;
+    uint _p4; uint _p5; uint _p6; uint _p7;
+};
+
+void main() {
+    uint ch = gl_WorkGroupID.x * 256u + gl_LocalInvocationID.x;
+    if (ch >= qkv_dim) return;
+    float sum = 0.0;
+    for (uint k = 0u; k < kern - 1u; k++)
+        sum += conv_state[cs_off + k * qkv_dim + ch] * conv1d_w[ch * kern + k];
+    float cur = qkv[ch];
+    sum += cur * conv1d_w[ch * kern + kern - 1u];
+    for (uint k = 0u; k < kern - 2u; k++)
+        conv_state[cs_off + k * qkv_dim + ch] = conv_state[cs_off + (k + 1u) * qkv_dim + ch];
+    conv_state[cs_off + (kern - 2u) * qkv_dim + ch] = cur;
+    qkv[ch] = sum / (1.0 + exp(-sum));
+}

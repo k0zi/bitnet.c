@@ -162,14 +162,29 @@ else
   LINK := $(CC)
 endif
 
+# --- Vulkan (optional: BN_ENABLE_VULKAN=1) ---
+ifdef BN_ENABLE_VULKAN
+  VULKAN_CFLAGS := -DBN_ENABLE_VULKAN
+  VULKAN_SRCS := src/gpu_vulkan.c
+  VULKAN_LDFLAGS := -lvulkan
+  GLSLC ?= glslc
+  VULKAN_SHADER_SRCS := $(wildcard shaders/vulkan/*.comp)
+  VULKAN_SHADER_SPVS := $(VULKAN_SHADER_SRCS:.comp=.spv)
+else
+  VULKAN_CFLAGS :=
+  VULKAN_SRCS :=
+  VULKAN_LDFLAGS :=
+  VULKAN_SHADER_SPVS :=
+endif
+
 SRCS = src/platform.c src/gguf.c $(QUANT_SRCS) src/turboquant.c $(MODEL_SRCS) $(MOE_SRCS) \
        $(TRANSFORMER_SRCS) src/tokenizer.c src/sampler.c \
-       src/threadpool.c src/sh_arena.c src/sh_log.c src/bn_alloc.c src/session.c src/prompt_cache.c src/generate.c $(WEBGPU_SRCS) src/main.c
-CFLAGS += $(WEBGPU_CFLAGS) $(METAL_CFLAGS) $(CUDA_CFLAGS)
-LDFLAGS += $(WGPU_LIB) $(WGPU_FRAMEWORKS) $(METAL_FRAMEWORKS) $(CUDA_LDFLAGS)
+       src/threadpool.c src/sh_arena.c src/sh_log.c src/bn_alloc.c src/session.c src/prompt_cache.c src/generate.c $(WEBGPU_SRCS) $(VULKAN_SRCS) src/main.c
+CFLAGS += $(WEBGPU_CFLAGS) $(METAL_CFLAGS) $(CUDA_CFLAGS) $(VULKAN_CFLAGS)
+LDFLAGS += $(WGPU_LIB) $(WGPU_FRAMEWORKS) $(METAL_FRAMEWORKS) $(CUDA_LDFLAGS) $(VULKAN_LDFLAGS)
 OBJS = $(SRCS:.c=.o) $(METAL_OBJS) $(CUDA_OBJS)
 HEADERS = $(wildcard include/*.h src/*.h src/transformer/*.h)
-BUILD_CONFIG := webgpu=$(if $(BN_ENABLE_WEBGPU),1,0) metal=$(if $(BN_ENABLE_METAL),1,0) cuda=$(if $(BN_ENABLE_CUDA),1,0) cc=$(CC) nvcc=$(NVCC) cuda_arch=$(CUDA_ARCH) cflags=$(CFLAGS)
+BUILD_CONFIG := webgpu=$(if $(BN_ENABLE_WEBGPU),1,0) metal=$(if $(BN_ENABLE_METAL),1,0) cuda=$(if $(BN_ENABLE_CUDA),1,0) vulkan=$(if $(BN_ENABLE_VULKAN),1,0) cc=$(CC) nvcc=$(NVCC) cuda_arch=$(CUDA_ARCH) cflags=$(CFLAGS)
 BUILD_CONFIG_STAMP := .build-config
 
 .PHONY: config-check
@@ -181,8 +196,14 @@ config-check:
 		printf '%s\n' "$(BUILD_CONFIG)" > $(BUILD_CONFIG_STAMP); \
 	fi
 
+# SPIR-V shader compilation
+shaders/vulkan/%.spv: shaders/vulkan/%.comp
+	$(GLSLC) --target-env=vulkan1.1 -o $@ $<
+
+vulkan-shaders: $(VULKAN_SHADER_SPVS)
+
 # Default target
-bitnet: config-check $(OBJS)
+bitnet: config-check $(OBJS) $(VULKAN_SHADER_SPVS)
 	$(LINK) $(CFLAGS) -o $@ $(filter %.o,$^) $(LDFLAGS)
 
 # Debug build

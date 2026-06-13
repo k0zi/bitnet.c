@@ -1,0 +1,62 @@
+// Per-head softmax over attention scores
+// Dispatch: (n_heads, 1, 1)
+#version 450
+
+layout(local_size_x = 256) in;
+
+layout(std430, set=0, binding=0) buffer Att { float att[]; };
+
+layout(push_constant) uniform PC { uint p0, p1, p2, p3, p4, p5, p6, p7; };
+
+shared float shared_mem[256];
+
+void main() {
+    uint h = gl_WorkGroupID.x;
+    uint tid = gl_LocalInvocationID.x;
+    uint n_heads = p0;
+    uint n_kv = p1;
+    uint seq_len = p2;
+
+    if (h >= n_heads) return;
+
+    uint base = h * seq_len;
+
+    // Phase 1: find max
+    float local_max = -3.402823e+38;
+    for (uint i = tid; i < n_kv; i += 256u)
+        local_max = max(local_max, att[base + i]);
+
+    shared_mem[tid] = local_max;
+    barrier();
+    for (uint s = 128u; s > 0u; s >>= 1u) {
+        if (tid < s) shared_mem[tid] = max(shared_mem[tid], shared_mem[tid + s]);
+        barrier();
+    }
+    float max_val = shared_mem[0];
+    barrier();
+
+    // Phase 2: exp(x - max) and sum
+    float local_sum = 0.0, comp = 0.0;
+    for (uint i = tid; i < n_kv; i += 256u) {
+        float e = exp(att[base + i] - max_val);
+        att[base + i] = e;
+        float y = e - comp;
+        float t = local_sum + y;
+        comp = (t - local_sum) - y;
+        local_sum = t;
+    }
+
+    shared_mem[tid] = local_sum;
+    barrier();
+    for (uint s = 128u; s > 0u; s >>= 1u) {
+        if (tid < s) shared_mem[tid] += shared_mem[tid + s];
+        barrier();
+    }
+    float sum_val = shared_mem[0];
+    barrier();
+
+    // Phase 3: normalize
+    float inv_sum = 1.0 / sum_val;
+    for (uint i = tid; i < n_kv; i += 256u)
+        att[base + i] *= inv_sum;
+}

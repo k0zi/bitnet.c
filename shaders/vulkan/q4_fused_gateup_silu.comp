@@ -1,0 +1,76 @@
+// Q4_0 repacked fused gate+up matvec with SiLU activation
+// Dispatch: (ceil(gate_rows/32), 1, 1)
+#version 450
+
+layout(local_size_x = 256) in;
+
+layout(std430, set=0, binding=0) readonly buffer Weights { uint weights[]; };
+layout(std430, set=0, binding=1) readonly buffer X      { float x[]; };
+layout(std430, set=0, binding=2)          buffer Out    { float out_buf[]; };
+
+layout(push_constant) uniform PC {
+    uint total_rows; uint cols; uint gate_rows; uint _pad3;
+    uint bias_offset; uint _p5; uint _p6; uint _p7;
+};
+
+shared float gate_reduce[256];
+shared float up_reduce[256];
+
+const uint TILE_ROWS = 32u;
+const uint THREADS_PER_ROW = 8u;
+
+vec4 dq4(uint w, uint sh, float s) {
+    return s * vec4(float(int((w>>sh)&0xFu)-8), float(int((w>>(sh+4u))&0xFu)-8),
+                    float(int((w>>(sh+8u))&0xFu)-8), float(int((w>>(sh+12u))&0xFu)-8));
+}
+
+void main() {
+    uint tid = gl_LocalInvocationID.x;
+    uint row_lane = tid & 7u;
+    uint local_row = tid >> 3u;
+    uint global_row = gl_WorkGroupID.x * TILE_ROWS + local_row;
+    uint blocks_per_row = cols >> 5u;
+    uint total_blocks = total_rows * blocks_per_row;
+
+    float gate_acc = 0.0, up_acc = 0.0;
+    if (global_row < gate_rows) {
+        uint gate_rb = global_row * blocks_per_row;
+        uint up_rb = (global_row + gate_rows) * blocks_per_row;
+        for (uint b = row_lane; b < blocks_per_row; b += THREADS_PER_ROW) {
+            float gs = uintBitsToFloat(weights[gate_rb + b]);
+            float us = uintBitsToFloat(weights[up_rb + b]);
+            uint gn = total_blocks + (gate_rb + b) * 4u;
+            uint un = total_blocks + (up_rb + b) * 4u;
+            uint gw0=weights[gn]; uint gw1=weights[gn+1u]; uint gw2=weights[gn+2u]; uint gw3=weights[gn+3u];
+            uint uw0=weights[un]; uint uw1=weights[un+1u]; uint uw2=weights[un+2u]; uint uw3=weights[un+3u];
+            uint e = b * 32u;
+            vec4 x0=vec4(x[e+0u],x[e+1u],x[e+2u],x[e+3u]);
+            vec4 x1=vec4(x[e+4u],x[e+5u],x[e+6u],x[e+7u]);
+            vec4 x2=vec4(x[e+8u],x[e+9u],x[e+10u],x[e+11u]);
+            vec4 x3=vec4(x[e+12u],x[e+13u],x[e+14u],x[e+15u]);
+            vec4 x4=vec4(x[e+16u],x[e+17u],x[e+18u],x[e+19u]);
+            vec4 x5=vec4(x[e+20u],x[e+21u],x[e+22u],x[e+23u]);
+            vec4 x6=vec4(x[e+24u],x[e+25u],x[e+26u],x[e+27u]);
+            vec4 x7=vec4(x[e+28u],x[e+29u],x[e+30u],x[e+31u]);
+            gate_acc+=dot(dq4(gw0,0u,gs),x0)+dot(dq4(gw0,16u,gs),x1)+dot(dq4(gw1,0u,gs),x2)+dot(dq4(gw1,16u,gs),x3)
+                     +dot(dq4(gw2,0u,gs),x4)+dot(dq4(gw2,16u,gs),x5)+dot(dq4(gw3,0u,gs),x6)+dot(dq4(gw3,16u,gs),x7);
+            up_acc +=dot(dq4(uw0,0u,us),x0)+dot(dq4(uw0,16u,us),x1)+dot(dq4(uw1,0u,us),x2)+dot(dq4(uw1,16u,us),x3)
+                    +dot(dq4(uw2,0u,us),x4)+dot(dq4(uw2,16u,us),x5)+dot(dq4(uw3,0u,us),x6)+dot(dq4(uw3,16u,us),x7);
+        }
+    }
+
+    gate_reduce[tid]=gate_acc; up_reduce[tid]=up_acc; barrier();
+    uint row_base = local_row * THREADS_PER_ROW;
+    if(row_lane<4u){gate_reduce[row_base+row_lane]+=gate_reduce[row_base+row_lane+4u];up_reduce[row_base+row_lane]+=up_reduce[row_base+row_lane+4u];}barrier();
+    if(row_lane<2u){gate_reduce[row_base+row_lane]+=gate_reduce[row_base+row_lane+2u];up_reduce[row_base+row_lane]+=up_reduce[row_base+row_lane+2u];}barrier();
+    if(row_lane<1u){gate_reduce[row_base]+=gate_reduce[row_base+1u];up_reduce[row_base]+=up_reduce[row_base+1u];}barrier();
+
+    if (row_lane == 0u && global_row < gate_rows) {
+        float g = gate_reduce[row_base], u_val = up_reduce[row_base];
+        if (bias_offset > 0u) {
+            g += uintBitsToFloat(weights[bias_offset + global_row]);
+            u_val += uintBitsToFloat(weights[bias_offset + global_row + gate_rows]);
+        }
+        out_buf[global_row] = (g / (1.0 + exp(-g))) * u_val;
+    }
+}

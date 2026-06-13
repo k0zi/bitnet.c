@@ -1,0 +1,68 @@
+// Delta rule SSM recurrence — one workgroup per V-head
+// S*=alpha, sk=S@k, S+=k outer (beta*(v-sk)), out=S^T@(q*q_scale)
+// Dispatch: (num_v_heads, 1, 1)
+#version 450
+
+layout(local_size_x = 256) in;
+
+layout(std430, set=0, binding=0) buffer State   { float state[]; };
+layout(std430, set=0, binding=1) buffer Out     { float out_buf[]; };
+layout(std430, set=0, binding=2) readonly buffer Q { float q[]; };
+layout(std430, set=0, binding=3) readonly buffer K { float k[]; };
+layout(std430, set=0, binding=4) readonly buffer V { float v[]; };
+layout(std430, set=0, binding=5) readonly buffer Alpha { float alpha[]; };
+layout(std430, set=0, binding=6) readonly buffer Beta  { float beta[]; };
+
+layout(push_constant) uniform PC {
+    uint hk; uint hv; uint num_k_heads; uint q_scale_bits;
+    uint state_off; uint state_layer_size; uint q_off; uint k_off;
+};
+
+shared float sk[512];
+
+void main() {
+    uint hv_idx = gl_WorkGroupID.x;
+    uint tid = gl_LocalInvocationID.x;
+    float q_scale = uintBitsToFloat(q_scale_bits);
+    uint state_float_off = state_off / 4u;
+    uint v_off = 2u * num_k_heads * hk;
+    uint hk_idx = hv_idx % num_k_heads;
+    uint state_base = state_float_off + hv_idx * hk * hv;
+    float decay = alpha[hv_idx];
+    float b = beta[hv_idx];
+
+    // Step 1: S *= alpha
+    uint total = hk * hv;
+    for (uint i = tid; i < total; i += 256u)
+        state[state_base + i] *= decay;
+    barrier();
+
+    // Step 2: sk = S @ k (Kahan)
+    for (uint vi = tid; vi < hv; vi += 256u) {
+        float sum = 0.0, comp = 0.0;
+        for (uint ki = 0u; ki < hk; ki++) {
+            float y = state[state_base + ki * hv + vi] * k[k_off + hk_idx * hk + ki] - comp;
+            float t = sum + y; comp = (t - sum) - y; sum = t;
+        }
+        sk[vi] = sum;
+    }
+    barrier();
+
+    // Step 3: S += k outer (beta * (v - sk))
+    for (uint i = tid; i < total; i += 256u) {
+        uint ki = i / hv, vi = i % hv;
+        float kk = k[k_off + hk_idx * hk + ki];
+        state[state_base + i] += kk * b * (v[v_off + hv_idx * hv + vi] - sk[vi]);
+    }
+    barrier();
+
+    // Step 4: out = S^T @ (q * q_scale) (Kahan)
+    for (uint vi = tid; vi < hv; vi += 256u) {
+        float sum = 0.0, comp = 0.0;
+        for (uint ki = 0u; ki < hk; ki++) {
+            float y = state[state_base + ki * hv + vi] * q[q_off + hk_idx * hk + ki] - comp;
+            float t = sum + y; comp = (t - sum) - y; sum = t;
+        }
+        out_buf[hv_idx * hv + vi] = sum * q_scale;
+    }
+}

@@ -1,0 +1,41 @@
+// GQA weighted sum: xb[h] = sum_i(att[h][i] * V[i])
+// Dispatch: (n_heads, 1, 1)
+#version 450
+
+layout(local_size_x = 256) in;
+
+layout(std430, set=0, binding=0) readonly buffer Att        { float att[]; };
+layout(std430, set=0, binding=1) readonly buffer ValueCache { float value_cache[]; };
+layout(std430, set=0, binding=2)          buffer XB         { float xb[]; };
+
+layout(push_constant) uniform PC { uint p0, p1, p2, p3, p4, p5, p6, p7; };
+
+void main() {
+    uint h = gl_WorkGroupID.x;
+    uint tid = gl_LocalInvocationID.x;
+    uint n_heads = p0;
+    uint head_size = p1;
+    uint n_kv = p2;
+    uint kv_mul = p3;
+    uint kv_dim = p4;
+    uint seq_len = p5;
+    uint loff = p6;
+
+    if (h >= n_heads) return;
+
+    uint kv_h = h / kv_mul;
+    uint out_base = h * head_size;
+
+    for (uint d = tid; d < head_size; d += 256u) {
+        float acc = 0.0, comp = 0.0;
+        for (uint i = 0u; i < n_kv; i++) {
+            uint v_base = loff + i * kv_dim + kv_h * head_size;
+            float a = att[h * seq_len + i];
+            float y = a * value_cache[v_base + d] - comp;
+            float t = acc + y;
+            comp = (t - acc) - y;
+            acc = t;
+        }
+        xb[out_base + d] = acc;
+    }
+}

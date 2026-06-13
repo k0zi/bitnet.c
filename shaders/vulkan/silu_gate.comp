@@ -1,0 +1,18 @@
+// SiLU gated activation: gate[i] = silu(gate[i]) * up[i]
+// Dispatch: (ceil(dim/256), 1, 1)
+#version 450
+
+layout(local_size_x = 256) in;
+
+layout(std430, set=0, binding=0) buffer Gate { float gate[]; };
+layout(std430, set=0, binding=1) readonly buffer Up { float up[]; };
+
+layout(push_constant) uniform PC { uint p0, p1, p2, p3, p4, p5, p6, p7; };
+
+void main() {
+    uint gid = gl_WorkGroupID.x * 256u + gl_LocalInvocationID.x;
+    uint dim = p0;
+    if (gid >= dim) return;
+    float g = gate[gid];
+    gate[gid] = (g / (1.0 + exp(-g))) * up[gid];
+}

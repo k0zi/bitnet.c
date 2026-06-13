@@ -1,0 +1,18 @@
+// Element-wise bias addition: x[i] += bias[i]
+// Dispatch: (ceil(dim/256), 1, 1)
+#version 450
+
+layout(local_size_x = 256) in;
+
+layout(std430, set=0, binding=0) buffer X    { float x[]; };
+layout(std430, set=0, binding=1) readonly buffer Bias { float bias[]; };
+
+layout(push_constant) uniform PC { uint p0, p1, p2, p3, p4, p5, p6, p7; };
+
+void main() {
+    uint gid = gl_WorkGroupID.x * 256u + gl_LocalInvocationID.x;
+    uint dim = p0;
+    uint input_offset = p1;
+    if (gid >= dim) return;
+    x[input_offset + gid] += bias[gid];
+}
